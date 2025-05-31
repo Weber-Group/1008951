@@ -2,10 +2,18 @@ import matplotlib.pyplot as plt
 import numpy as np
 import h5py
 from typing import List, Dict, Union
+from scipy import signal
+from scipy.fft import rfft, irfft, rfftfreq
+from datetime import datetime, timedelta, timezone
+#from epicsArch import *
+from scipy.interpolate import interp1d
+import scipy.io
+from IPython import get_ipython
+import re
 
 """
 This file contains utilities for performing radial averaging on image data, 
-exploring HDF5 file structures, and visualizing detector data.
+exploring HDF5 file structures, visualizing detector data, and other useful utilities.
 
 Classes:
     RadialAverager: Performs radial averaging on 2D data.
@@ -16,6 +24,7 @@ Functions:
     get_leaves(f, saveto, verbose=False): Extracts datasets from an HDF5 file.
     runNumToString(num): Converts a number to a zero-padded string.
     plot_jungfrau(x, y, f, ax=None, shading='nearest', *args, **kwargs): Plots Jungfrau detector counts.
+    recalculateDG2IPM(rawDG2Traces,k_start=876, k_end=926): Recalculates the ipm_dg2 variables from the raw dg2 traces.
 """
 class RadialAverager(object):
 
@@ -121,7 +130,7 @@ def plot_jungfrau(x, y, f, ax=None, shading='nearest', *args, **kwargs):
         pcm = ax.pcolormesh(x[i], y[i], f[i], shading=shading, *args, **kwargs)
     return pcm
 
-def combineRuns(runNumbers, folder, keys_to_combine, keys_to_sum, keys_to_check, verbose=False):
+def combineRuns(runNumbers, folder, keys_to_combine, keys_to_sum, keys_to_check, verbose=False, archImport=True):
     """Combine data from multiple runs into a single dataset.
 
     Parameters
@@ -149,10 +158,21 @@ def combineRuns(runNumbers, folder, keys_to_combine, keys_to_sum, keys_to_check,
             data_array.append(data)
     data_combined = {}
     for key in keys_to_combine:
-        arr = np.squeeze(data_array[0][key])
-        for data in data_array[1:]:
-            arr = np.concatenate((arr,np.squeeze(data[key])),axis=0)
-        data_combined[key] = arr
+        # Special routine for loading the gas cell pressure
+        epicsLoad = False # Default flag value
+        if (key == 'epicsUser/gasCell_pressure') & (archImport):
+            try:
+                arr = np.squeeze(data_array[0][key])
+                for data in data_array[1:]:
+                    arr = np.concatenate((arr,np.squeeze(data[key])),axis=0)
+                data_combined[key] = arr
+            except:
+                epicsLoad = True # Set flag if we can't load from the files
+        else: # All other keys load normally
+            arr = np.squeeze(data_array[0][key])
+            for data in data_array[1:]:
+                arr = np.concatenate((arr,np.squeeze(data[key])),axis=0)
+            data_combined[key] = arr
     run_indicator = np.array([])
     for i,runNumber in enumerate(runNumbers):
         run_indicator = np.concatenate((run_indicator,runNumber*np.ones_like(data_array[i]['lightStatus/xray'])))
@@ -168,6 +188,22 @@ def combineRuns(runNumbers, folder, keys_to_combine, keys_to_sum, keys_to_check,
             if not np.array_equal(data[key],arr):
                 print(f'Problem with key {key} in run {runNumbers[i]}')
         data_combined[key] = arr
+    # Now to do the special gas cell pressure loading if the flag was set
+    if epicsLoad:
+        archive = EpicsArchive()
+        unixTime = data_combined['unixTime']
+        epicsPressure = np.array([]) # Init empty array
+        for i,runNumber in enumerate(runNumbers):
+            # Pull out start and end times from each run
+            runUnixTime = unixTime[run_indicator==runNumber]
+            startTime = runUnixTime[0]
+            endTime = runUnixTime[-1]
+            [times,pressure] = archive.get_points(PV='CXI:MKS670:READINGGET', start=startTime, end=endTime,unit="seconds",raw=True,two_lists=True); # Make Request
+            # Interpolate the data
+            interp_func = interp1d(times, pressure, kind='previous', fill_value='extrapolate')
+            epicsPressure = np.append(epicsPressure,interp_func(runUnixTime)) # Append the data
+        # Once all the data is loaded in
+        data_combined['epicsUser/gasCell_pressure'] = epicsPressure # Save to the original key.       
     print('Loaded Data')
     return data_combined
 
@@ -244,3 +280,121 @@ def runNumToString(num):
     while len(numstr) < 4:
         numstr = '0' + numstr
     return numstr
+
+def recalculateDG2IPM(rawDG2Traces,k_start=876, k_end=926):
+    """Recalculate the ipm_dg2 variables given the raw DG2 traces.
+
+    Parameters
+    ----------
+    rawDG2Traces : np.ndarray (float)
+        Raw DG2 traces.
+    k_start : int
+        Start index of the maximum search, default is 876
+    k_end : int
+        End index of the maximum search, default is 926
+
+    Returns
+    -------
+    sum : np.ndarray (float) 
+        Sum of the DG2 readings. Analagous to ipm_dg2/sum.
+    xpos : np.ndarray (float)
+        X position of the xray beam on the DG2 IPM, in mm
+    ypos : np.ndarray (float)
+        Y position of the xray beam on the DG2 IPM, in mm
+    peaks : np.ndarray (float)
+        Peak heights of the traces after applying the fast impulse response filter
+    """
+    # Fast Impulse Response filter coefficients
+    fir = [0.125, 0.125, 0.125, 0.125, 0.125, 0.125, 0.125, 0.125, 
+           0, 0, 0, 0, 0, 0, 
+           -0.125, -0.125, -0.125, -0.125, -0.125, -0.125, -0.125, -0.125]
+    filtered_trace = -signal.lfilter(fir, 1, rawDG2Traces, axis=-1) # Filtering the traces
+    peaks = np.max(np.abs(filtered_trace[:, :, k_start:k_end]), axis=2) # Calculating all of the peak values
+    Cx = -4.79 # X Calibration constant, in % per mm
+    Cy = -5.12 # Y Calibration constant, in % per mm
+    xpos = (100*(peaks[:,1]-peaks[:,3])/(peaks[:,1]+peaks[:,3]))/Cx
+    ypos = (100*(peaks[:,2]-peaks[:,4])/(peaks[:,2]+peaks[:,4]))/Cy
+    sums = peaks.sum(axis=1)
+    return sums, xpos, ypos, peaks
+
+def hist2dLinFit(xdata,ydata,bins, ax=None,linfit=False,xFrac=None,xVal=None):
+    if ax is None:
+        ax = plt.gca()
+    if linfit:
+        if xFrac==None:
+            if xVal==None:
+                # Assume total data set for fit
+                xVal = xdata.max()
+            # Do the cropping based on the value
+            xCrop = xdata[xdata<=xVal]
+            yCrop = ydata[xdata<=xVal]
+        else:
+            # Do the cropping based on the fraction of the max
+            xCrop = xdata[xdata/xdata.max()<=xFrac]
+            yCrop = ydata[xdata/xdata.max()<=xFrac]
+        poly_coeffs = np.polyfit(xCrop, yCrop, 1)
+        print(poly_coeffs)
+        # Generate fit curve
+        x_fit = np.linspace(np.min(xdata), np.max(xdata), 100)
+        y_fit = np.polyval(poly_coeffs, x_fit)
+        y_lin = np.polyval(poly_coeffs, xdata)
+        residuals = ydata-y_lin
+    
+        rcoeff = scipy.stats.pearsonr(xCrop, yCrop)
+        plt.text(0.1, 0.8, f'Pearson r coeff: {rcoeff.statistic:.9f}',
+                 fontsize=12, fontweight='bold', transform=plt.gca().transAxes, ha='left', color='White')
+        # Overlay the fit curve
+        plt.plot(x_fit, y_fit, color='red', linewidth=2, label='Linear Fit', linestyle='--',zorder=2)
+        plt.legend()
+    
+    plt.hist2d(xdata,ydata,bins, zorder=1);
+    return residuals
+
+
+def enable_underscore_cleanup():
+    """Registers a post-cell hook to delete user-defined _ variables after each cell."""
+    ipython = get_ipython()
+    user_ns = ipython.user_ns  # This gives you access to the Jupyter notebook namespace
+
+    def clean_user_underscore_vars(*args, **kwargs):
+        def is_user_defined_underscore(var):
+            return (
+                var.startswith('_')
+                and not re.match(r'^_i\d*$|^_\d*$|^_ih$|^_oh$|^_ii*$|^_iii$|^_dh$|^_$', var)
+                and not var.startswith('__')
+            )
+
+        for var in list(user_ns):
+            if is_user_defined_underscore(var):
+                del user_ns[var]
+
+    ipython.events.register('post_run_cell', clean_user_underscore_vars)
+
+def keV2Angstroms(keV):
+    return 12.39841984/keV
+
+def extract_freq_component(traces, fs, target_freq, bandwidth=1.0):
+    """
+    Extracts a narrow band around `target_freq` from each trace.
+    
+    Parameters:
+        traces: 2D array (n_traces, n_samples)
+        fs: Sampling rate (Hz)
+        target_freq: Frequency to extract (Hz)
+        bandwidth: Half-width of frequency band to retain (Hz)
+        
+    Returns:
+        Array of filtered traces.
+    """
+    n_samples = traces.shape[1]
+    freqs = rfftfreq(n_samples, 1/fs)
+    band_mask = (freqs > target_freq - bandwidth) & (freqs < target_freq + bandwidth)
+    
+    filtered_traces = []
+    for trace in traces:
+        fft_vals = rfft(trace)
+        fft_vals[~band_mask] = 0
+        filtered_trace = irfft(fft_vals, n=n_samples)
+        filtered_traces.append(filtered_trace)
+    
+    return np.array(filtered_traces)
